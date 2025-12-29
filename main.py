@@ -1,0 +1,341 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from datetime import datetime
+import os
+import shutil
+from pypdf import PdfWriter
+
+
+# Database setup
+DATABASE_URL = "postgresql://postgres:qwerty1234@localhost:5432/qaqc_db"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Database models
+class Project(Base):
+    __tablename__ = "project"
+    id = Column(Integer, primary_key=True, index=True)
+    project_name = Column(String, nullable=False)
+    project_code = Column(String, unique=True, nullable=False)
+    location = Column(String)
+    production_logs = relationship("ProductionLog", back_populates="project")
+    qc_logs = relationship("QCLog", back_populates="project")
+
+class ProductionLog(Base):
+    __tablename__ = "production_log"
+    id = Column(Integer, primary_key=True, index=True)
+    panel_id = Column(String, unique=True, nullable=False)
+    product_type = Column(String)
+    quantity = Column(Integer)
+    project_id = Column(Integer, ForeignKey("project.id"))
+    project = relationship("Project", back_populates="production_logs")
+    qc_logs = relationship("QCLog", back_populates="production_log")
+
+class QCLog(Base):
+    __tablename__ = "qc_log"
+    id = Column(Integer, primary_key=True, index=True)
+    panel_id = Column(String, nullable=False)
+    inspection_date = Column(DateTime, default=datetime.utcnow)
+    inspector_name = Column(String)
+    status = Column(String, default="Pending")
+    remarks = Column(Text)
+    project_id = Column(Integer, ForeignKey("project.id"))
+    production_log_id = Column(Integer, ForeignKey("production_log.id"))
+    project = relationship("Project", back_populates="qc_logs")
+    production_log = relationship("ProductionLog", back_populates="qc_logs")
+
+class ChecklistTemplate(Base):
+    __tablename__ = "checklist_template"
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("project.id"))
+    template_name = Column(String, nullable=False)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+class MIRMaster(Base):
+    __tablename__ = "mir_master"
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("project.id"))
+    mir_number = Column(String, unique=True, nullable=False)
+    status = Column(String, default="Draft")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class MIRPanel(Base):
+    __tablename__ = "mir_panel"
+    id = Column(Integer, primary_key=True, index=True)
+    mir_id = Column(Integer, ForeignKey("mir_master.id"))
+    panel_id = Column(String, nullable=False)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# FastAPI app
+app = FastAPI(title="QAQC System", version="0.1.0")
+
+# Pydantic models
+class ProjectCreate(BaseModel):
+    project_name: str
+    project_code: str
+    location: str = None
+
+class ProductionLogCreate(BaseModel):
+    panel_id: str
+    product_type: str
+    quantity: int
+    project_id: int
+
+class QCLogCreate(BaseModel):
+    panel_id: str
+    inspector_name: str
+    remarks: str = None
+    project_id: int
+    production_log_id: int
+
+# Database session dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+db = SessionLocal()
+
+# Helper functions
+def generate_mir_number(project_code: str, db_session) -> str:
+    """Generate sequential MIR number for a project"""
+    last_mir = db_session.query(MIRMaster).filter(
+        MIRMaster.mir_number.like(f"{project_code}-MIR-%")
+    ).order_by(MIRMaster.id.desc()).first()
+    
+    if last_mir:
+        last_num = int(last_mir.mir_number.split("-")[-1])
+        new_num = last_num + 1
+    else:
+        new_num = 1
+    
+    return f"MIR-{new_num:04d}"
+
+def create_mir_folder(project_id: int, mir_number: str, panel_ids: list):
+    """Create folder structure for MIR with subfolders and index"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        return
+    
+    # Create main MIR folder
+    mir_folder = f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}"
+    os.makedirs(mir_folder, exist_ok=True)
+    
+    # Create subfolders
+    subfolders = ["source_files", "merged_pdf", "final_mir"]
+    for subfolder in subfolders:
+        os.makedirs(f"{mir_folder}/{subfolder}", exist_ok=True)
+    
+    # Create index file
+    index_file = f"{mir_folder}/index.txt"
+    with open(index_file, "w") as f:
+        f.write(f"MIR Number: {project.project_code}-{mir_number}\n")
+        f.write(f"Project: {project.project_name}\n")
+        f.write(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"\nPanel IDs:\n")
+        for panel_id in panel_ids:
+            f.write(f"  - {panel_id}\n")
+
+def attach_documents_to_mir(project_id: int, mir_number: str, panel_ids: list):
+    """Copy all documents from production logs to MIR source_files folder"""
+    
+    # Get project details
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        return
+    
+    # MIR folder path
+    mir_folder = f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}"
+    source_files_folder = f"{mir_folder}/source_files"
+    
+    # Create source_files folder if it doesn't exist
+    os.makedirs(source_files_folder, exist_ok=True)
+    
+    # Copy files from each production log
+    for panel_id in panel_ids:
+        panel_folder = f"storage/project_{project_id}/production_logs/{panel_id}"
+        
+        # Check if production log folder exists
+        if not os.path.exists(panel_folder):
+            continue
+        
+        # Copy files from checklists, drawings, and photos folders
+        for subfolder in ["checklists", "drawings", "photos"]:
+            source_path = f"{panel_folder}/{subfolder}"
+            
+            if os.path.exists(source_path) and os.path.isdir(source_path):
+                # Get all files in the subfolder
+                for filename in os.listdir(source_path):
+                    file_path = os.path.join(source_path, filename)
+                    
+                    # Only copy files, not subdirectories
+                    if os.path.isfile(file_path):
+                        # Create unique filename to avoid overwrites
+                        dest_filename = f"{panel_id}_{subfolder}_{filename}"
+                        dest_path = os.path.join(source_files_folder, dest_filename)
+                        
+                        # Copy the file
+                        shutil.copy2(file_path, dest_path)
+
+def merge_mir_pdfs(project_id: int, mir_number: str):
+    """Merge all PDFs from source_files into FINAL_MIR.pdf"""
+    
+    # Get project details
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        return None
+    
+    mir_path = f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}/source_files"
+    output_pdf = f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}/FINAL_MIR.pdf"
+    
+    # Check if source_files folder exists
+    if not os.path.exists(mir_path):
+        return None
+    
+    merger = PdfMerger()
+    
+    # Define merge order by category
+    ordered_groups = [
+        "MIR_FORM_",
+        "PANEL_LIST_",
+        "CHECKLIST",
+        "DRAWING_",
+        "PHOTO"
+    ]
+    
+    # Get all files from source_files
+    files = os.listdir(mir_path)
+    
+    # Merge PDFs in defined order
+    for group in ordered_groups:
+        for file in sorted(files):
+            if file.endswith(".pdf") and group in file:
+                merger.append(os.path.join(mir_path, file))
+    
+    # Write merged PDF
+    merger.write(output_pdf)
+    merger.close()
+    
+    return output_pdf
+
+# API Routes
+@app.get("/projects")
+def list_projects():
+    projects = db.query(Project).all()
+    return projects
+
+@app.post("/projects")
+def create_project(project: ProjectCreate):
+    db_project = Project(
+        project_name=project.project_name,
+        project_code=project.project_code,
+        location=project.location
+    )
+    db.add(db_project)
+    db.commit()
+    db.refresh(db_project)
+    
+    # Create project folder structure
+    project_folder = f"storage/project_{db_project.id}"
+    os.makedirs(f"{project_folder}/production_logs", exist_ok=True)
+    os.makedirs(f"{project_folder}/MIR", exist_ok=True)
+    
+    return db_project
+
+@app.post("/production-logs")
+def create_production_log(log: ProductionLogCreate):
+    db_log = ProductionLog(
+        panel_id=log.panel_id,
+        product_type=log.product_type,
+        quantity=log.quantity,
+        project_id=log.project_id
+    )
+    db.add(db_log)
+    db.commit()
+    db.refresh(db_log)
+    return db_log
+
+@app.get("/qc-logs")
+def list_qc_logs():
+    qc_logs = db.query(QCLog).all()
+    return qc_logs
+
+@app.post("/qc-logs/{qc_log_id}/approve")
+def approve_qc_log(qc_log_id: int):
+    qc_log = db.query(QCLog).filter(QCLog.id == qc_log_id).first()
+    if not qc_log:
+        raise HTTPException(status_code=404, detail="QC Log not found")
+    
+    qc_log.status = "Approved"
+    db.commit()
+    
+    return {"message": "QC Log approved", "qc_log_id": qc_log_id, "status": "Approved"}
+
+@app.post("/projects/{project_id}/checklist-template")
+def upload_checklist_template(project_id: int, template_name: str):
+    template = ChecklistTemplate(
+        project_id=project_id,
+        template_name=template_name
+    )
+    db.add(template)
+    db.commit()
+    db.refresh(template)
+    return {"message": "Checklist template uploaded", "template_id": template.id}
+
+@app.post("/projects/{project_id}/mir")
+def create_mir(project_id: int, panel_ids: list[str]):
+    # Get project
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Generate MIR number
+    mir_number = generate_mir_number(project.project_code, db)
+    
+    # Create MIR master record
+    mir = MIRMaster(
+        project_id=project_id,
+        mir_number=mir_number
+    )
+    db.add(mir)
+    db.commit()
+    db.refresh(mir)
+    
+    # Add panel associations
+    for panel in panel_ids:
+        db.add(MIRPanel(
+            mir_id=mir.id,
+            panel_id=panel
+        ))
+    db.commit()
+    
+    # Create folder structure and copy documents
+    create_mir_folder(project_id, mir_number, panel_ids)
+    attach_documents_to_mir(project_id, mir_number, panel_ids)
+    
+    # Merge PDFs into final document
+    final_pdf = merge_mir_pdfs(project_id, mir_number)
+    
+    # Update status based on merge result
+    if final_pdf:
+        mir.status = "Final"
+    else:
+        mir.status = "Ready"
+    
+    db.commit()
+    
+    return {
+        "mir_number": mir_number,
+        "status": mir.status,
+        "folder_created": True,
+        "pdf_merged": final_pdf is not None
+    }
