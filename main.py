@@ -305,3 +305,117 @@ def create_mir(project_id: int, panel_ids: list[str], db=Depends(get_db)):
         "folder_created": True,
         "pdf_merged": final_pdf is not None,
     }
+
+# ============== PDF DOWNLOAD ENDPOINTS ==============
+
+@app.get("/projects/{project_id}/mir/{mir_number}/pdf")
+def download_mir_pdf(
+    project_id: int,
+    mir_number: str,
+    view: bool = False,
+    db = Depends(get_db)
+):
+    """
+    Download or view MIR PDF file
+    
+    Args:
+        project_id: Project ID number
+        mir_number: MIR number (e.g., MIR-0001)
+        view: If True, opens in browser. If False, downloads.
+    
+    Example URLs:
+        Download: /projects/1/mir/MIR-0001/pdf
+        View: /projects/1/mir/MIR-0001/pdf?view=true
+    """
+    from fastapi.responses import FileResponse
+    from pathlib import Path
+    
+    # Get project to get project_code
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Build PDF path
+    pdf_path = Path(f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}/FINAL_MIR.pdf")
+    
+    # Check if file exists
+    if not pdf_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "MIR PDF not found",
+                "project_id": project_id,
+                "mir_number": mir_number,
+                "expected_path": str(pdf_path)
+            }
+        )
+    
+    # Set headers for download or view
+    disposition = "inline" if view else "attachment"
+    headers = {
+        "Content-Disposition": f'{disposition}; filename="{project.project_code}-{mir_number}.pdf"'
+    }
+    
+    return FileResponse(
+        path=str(pdf_path),
+        media_type="application/pdf",
+        headers=headers,
+        filename=f"{project.project_code}-{mir_number}.pdf"
+    )
+
+@app.get("/projects/{project_id}/mir/list")
+def list_project_mirs(project_id: int, db = Depends(get_db)):
+    """
+    List all available MIR PDFs for a project
+    
+    Returns information about all generated MIRs including:
+    - MIR number
+    - Status
+    - File size
+    - Download URL
+    """
+    from pathlib import Path
+    
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Get all MIRs from database
+    mirs = db.query(MIRMaster).filter(MIRMaster.project_id == project_id).all()
+    
+    result = []
+    for mir in mirs:
+        pdf_path = Path(f"storage/project_{project_id}/MIR/{project.project_code}-{mir.mir_number}/FINAL_MIR.pdf")
+        
+        mir_info = {
+            "mir_number": mir.mir_number,
+            "status": mir.status,
+            "created_at": mir.created_at.isoformat() if mir.created_at else None,
+            "pdf_exists": pdf_path.exists(),
+            "download_url": f"/projects/{project_id}/mir/{mir.mir_number}/pdf" if pdf_path.exists() else None
+        }
+        
+        if pdf_path.exists():
+            mir_info["size_bytes"] = pdf_path.stat().st_size
+            mir_info["size_mb"] = round(pdf_path.stat().st_size / (1024 * 1024), 2)
+        
+        result.append(mir_info)
+    
+    return {
+        "project_id": project_id,
+        "project_code": project.project_code,
+        "mirs": result,
+        "count": len(result)
+    }
+
+@app.get("/health")
+def health_check():
+    """
+    Health check endpoint for monitoring
+    """
+    from pathlib import Path
+    return {
+        "status": "healthy",
+        "service": "QC System Backend",
+        "storage_accessible": Path("storage").exists()
+    }
