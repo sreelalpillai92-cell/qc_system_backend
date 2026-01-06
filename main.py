@@ -6,6 +6,9 @@ from datetime import datetime
 import os
 import shutil
 from pypdf import PdfWriter
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
 
 # Database setup (SQLite for Render)
 DATABASE_URL = "sqlite:///./database.db"
@@ -184,6 +187,65 @@ def merge_mir_pdfs(project_id: int, mir_number: str, db_session):
     """Merge all PDFs from source_files into FINAL_MIR.pdf"""
     project = db_session.query(Project).filter(Project.id == project_id).first()
     if not project:
+        def generate_mir_cover_page(project_id: int, mir_number: str, panel_ids: list[str], db_session):
+    """Generate MIR cover page PDF"""
+    project = db_session.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        return None
+    
+    base_path = f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}"
+    output_file = f"{base_path}/source_files/MIR_FORM_{mir_number}.pdf"
+    
+    c = canvas.Canvas(output_file, pagesize=A4)
+    width, height = A4
+    
+    # Title
+    c.setFont("Helvetica-Bold", 24)
+    c.drawString(1*inch, height - 1*inch, "Material Inspection Report")
+    
+    # MIR Details
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(1*inch, height - 2*inch, f"MIR Number: {project.project_code}-{mir_number}")
+    c.drawString(1*inch, height - 2.5*inch, f"Project: {project.project_name}")
+    c.drawString(1*inch, height - 3*inch, f"Location: {project.location or 'N/A'}")
+    c.drawString(1*inch, height - 3.5*inch, f"Date: {datetime.now().strftime('%Y-%m-%d')}")
+    c.drawString(1*inch, height - 4*inch, f"Total Panels: {len(panel_ids)}")
+    
+    c.save()
+    return output_file
+
+
+def generate_panel_list_pdf(project_id: int, mir_number: str, panel_ids: list[str], db_session):
+    """Generate panel list PDF"""
+    project = db_session.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        return None
+    
+    base_path = f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}"
+    output_file = f"{base_path}/source_files/PANEL_LIST_{mir_number}.pdf"
+    
+    c = canvas.Canvas(output_file, pagesize=A4)
+    width, height = A4
+    
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(1*inch, height - 1*inch, "Panel List")
+    
+    c.setFont("Helvetica", 12)
+    y_position = height - 2*inch
+    
+    for idx, panel_id in enumerate(panel_ids, 1):
+        c.drawString(1*inch, y_position, f"{idx}. {panel_id}")
+        y_position -= 0.3*inch
+        
+        if y_position < 1*inch:  # New page if needed
+            c.showPage()
+            c.setFont("Helvetica", 12)
+            y_position = height - 1*inch
+    
+    c.save()
+    return output_file
+
+
         return None
 
     base_path = f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}"
@@ -293,6 +355,10 @@ def create_mir(project_id: int, panel_ids: list[str], db=Depends(get_db)):
     db.commit()
 
     create_mir_folder(project_id, mir_number, panel_ids, db)
+    
+    # Generate PDF documents
+    generate_mir_cover_page(project_id, mir_number, panel_ids, db)
+    generate_panel_list_pdf(project_id, mir_number, panel_ids, db)
     attach_documents_to_mir(project_id, mir_number, panel_ids)
     final_pdf = merge_mir_pdfs(project_id, mir_number, db)
 
