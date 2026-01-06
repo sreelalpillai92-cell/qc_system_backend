@@ -4,3 +4,4 @@ sqlalchemy==2.0.25
 pydantic==2.5.3
 pypdf==3.17.4
 psycopg2==2.9.9
+reportlab
