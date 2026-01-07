@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Text, ForeignKey, DateTime
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
@@ -78,6 +78,15 @@ class MIRPanel(Base):
     id = Column(Integer, primary_key=True, index=True)
     mir_id = Column(Integer, ForeignKey("mir_master.id"))
     panel_id = Column(String, nullable=False)
+
+class MIRTemplate(Base):
+    __tablename__ = "mir_template"
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("project.id"))
+    template_name = Column(String, nullable=False)
+    template_type = Column(String, default="cover_page")  # cover_page, panel_list, custom
+    file_path = Column(String, nullable=False)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
 
 
 # Create tables
@@ -276,6 +285,46 @@ def upload_checklist_template(project_id: int, template_name: str, db=Depends(ge
     db.refresh(template)
     return {"message": "Checklist template uploaded", "template_id": template.id}
 
+
+@app.post("/projects/{project_id}/mir-template")
+async def upload_mir_template(
+    project_id: int,
+    template_name: str,
+    template_type: str = "cover_page",
+    file: UploadFile = File(...),
+    db=Depends(get_db)
+):
+    """Upload MIR template PDF for a project"""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Create templates folder
+    template_folder = f"storage/project_{project_id}/templates"
+    os.makedirs(template_folder, exist_ok=True)
+    
+    # Save uploaded file
+    file_path = f"{template_folder}/{template_type}_{file.filename}"
+    with open(file_path, "wb") as f:
+        content = await file.read()
+        f.write(content)
+    
+    # Save template record in database
+    template = MIRTemplate(
+        project_id=project_id,
+        template_name=template_name,
+        template_type=template_type,
+        file_path=file_path
+    )
+    db.add(template)
+    db.commit()
+    db.refresh(template)
+    
+    return {
+        "message": "MIR template uploaded successfully",
+        "template_id": template.id,
+        "file_path": file_path
+    }
 
 @app.post("/projects/{project_id}/mir")
 def create_mir(project_id: int, panel_ids: list[str], db=Depends(get_db)):
