@@ -188,8 +188,10 @@ def merge_mir_pdfs(project_id: int, mir_number: str, db_session):
     project = db_session.query(Project).filter(Project.id == project_id).first()
     if not project:
                 return None
-        ut_pdf = f"{base_path}/FINAL_MIR.pdf"
-
+    
+    base_path = f"storage/project_{project_id}/MIR/{project.project_code}-{mir_number}"
+    mir_path = f"{base_path}/source_files"
+    output_pdf = f"{base_path}/FINAL_MIR.pdf"
     if not os.path.exists(mir_path):
         return None
 
